@@ -1,7 +1,7 @@
 info = {
     name: "Управление вентилятором Тиона в зависимости от уровня CO2",
     description: "Установка скорости вентилятора Тиона в зависимости от уровня CO2",
-    version: "1.3",
+    version: "1.5",
     author: "xor777",
     onStart: false,
     
@@ -59,78 +59,72 @@ info = {
 
 function trigger(source, value, variables, options) {
     try {
-        log.info("Сработал триггер CO2, значение: {}", value);
-        
-        var co2Room = null;
-        try {
-            var co2Accessory = source.getAccessory();
-            if (co2Accessory) {
-                co2Room = co2Accessory.getRoom();
-                if (co2Room) {
-                    log.info("Датчик CO2 находится в комнате: [{}]", co2Room.getName());
-                } else {
-                    log.error("Не удалось определить комнату датчика CO2");
-                    return;
-                }
-            } else {
-                log.error("Не удалось получить аксессуар датчика CO2");
-                return;
-            }
-        } catch (e) {
-            log.error("Ошибка при определении комнаты датчика CO2: {}", e.message);
+        var co2Accessory = source.getAccessory();
+        if (!co2Accessory) {
+            log.error("Не удалось получить аксессуар датчика CO2");
             return;
         }
-
-        var fanSpeed;
         
+        var co2Room = co2Accessory.getRoom();
+        if (!co2Room) {
+            log.error("Не удалось определить комнату датчика CO2");
+            return;
+        }
+        
+        log.info("Изменение уровня CO2: {} ppm в комнате [{}]", value, co2Room.getName());
+        
+        var fanSpeed;
         if (value < options.lowCO2) {
             fanSpeed = 1;
-            log.info("Минимальный уровень CO2: {}, скорость: {}", value, fanSpeed);
         } else if (value < options.mediumCO2) {
             fanSpeed = 2;
-            log.info("Низкий уровень CO2: {}, скорость: {}", value, fanSpeed);
         } else if (value < options.highCO2) {
             fanSpeed = 3;
-            log.info("Средний уровень CO2: {}, скорость: {}", value, fanSpeed);
         } else if (value < options.turboThreshold) {
             fanSpeed = 4;
-            log.info("Высокий уровень CO2: {}, скорость: {}", value, fanSpeed);
         } else {
             fanSpeed = 5;
-            log.info("Максимальный уровень CO2: {}, скорость: {} - ТУРБО", value, fanSpeed);
         }
-
+        
+        log.info("Ставим скорость на: {}", fanSpeed);
+        
         var accessories = co2Room.getAccessories();
-        var thermostatFound = false;
+        var tionCount = 0;
         
         for (var j = 0; j < accessories.length; j++) {
             var acc = accessories[j];
-            var services = acc.getServices();
             
-            for (var k = 0; k < services.length; k++) {
-                var service = services[k];
-                if (service.getType() === HS.Thermostat) {
-                    thermostatFound = true;
-                    log.info("Найден бризер: [{}] в комнате [{}]", acc.getName(), co2Room.getName());
-                    
-                    try {
-                        var fanSpeedChar = service.getCharacteristic(HC.C_FanSpeed);
-                        if (fanSpeedChar) {
-                            fanSpeedChar.setValue(fanSpeed);
-                            log.info("Установлена скорость вентилятора: {}", fanSpeed);
-                        } else {
-                            log.error("Характеристика C_FanSpeed не найдена");
-                        }
-                    } catch (e) {
-                        log.error("Ошибка при установке скорости: {}", e.message);
+            try {
+                var model = acc.getModel ? acc.getModel() : null;
+                if (model !== "Tion") continue;
+                
+                var thermostatService = null;
+                var services = acc.getServices();
+                
+                for (var k = 0; k < services.length; k++) {
+                    if (services[k].getType() === HS.Thermostat) {
+                        thermostatService = services[k];
+                        break;
                     }
                 }
+                
+                if (!thermostatService) continue;
+                
+                var fanSpeedChar = thermostatService.getCharacteristic(HC.C_FanSpeed);
+                if (!fanSpeedChar) {
+                    log.warn("У бризера Tion [{}] не найдена характеристика C_FanSpeed", acc.getName());
+                    continue;
+                }
+                
+                fanSpeedChar.setValue(fanSpeed);
+                log.info("Бризер Tion [{}]: установлена скорость {}", acc.getName(), fanSpeed);
+                tionCount++;
+                
+            } catch (e) {
+                log.error("Ошибка при обработке устройства [{}]: {}", acc.getName(), e.message);
             }
         }
         
-        if (!thermostatFound) {
-            log.warn("В комнате {} не найдено ни одного бризера", co2Room.getName());
-        }
     } catch (e) {
         log.error("Ошибка: {}", e.message);
     }
