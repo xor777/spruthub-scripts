@@ -29,13 +29,19 @@ info = {
             name: { ru: "Скорость по умолчанию", en: "Default fan speed" },
             type: "Integer",
             value: 1,
-            desc: { ru: "Если датчик не выбран, используется эта скорость (0 – выключить, 1‑5 – скорость)", en: "Used when sensor not selected (0 – off, 1‑5 – speed)" }
+            desc: {
+                ru: "Используется ТОЛЬКО если датчик CO2 не выбран. 0 – выключить, 1‑5 – скорость",
+                en: "Used ONLY when no CO2 sensor is selected. 0 – off, 1‑5 – speed"
+            }
         },
         turnOffAtLowCO2: {
             name: { ru: "Выключать бризер при низком CO2", en: "Turn off at low CO2" },
             type: "Boolean",
             value: false,
-            desc: { ru: "Если включено и CO2 ниже нижнего порога, бризер выключается. Иначе работает на тихой скорости.", en: "If enabled and CO2 below low threshold the fan turns off, otherwise quiet speed." }
+            desc: {
+                ru: "Работает только при выбранном датчике CO2. Если включено и CO2 ниже нижнего порога, бризер выключается, иначе работает на тихой скорости.",
+                en: "Works only when a CO2 sensor is selected. If enabled and CO2 is below the low threshold the fan turns off, otherwise quiet speed."
+            }
         },
         lowCO2: {
             name: {
@@ -100,7 +106,7 @@ info = {
         stopWhenAway: {
             name: { ru: "Ограничивать скорость в режиме 'Нет дома'", en: "Limit speed when away" },
             type: "Boolean",
-            value: true,
+            value: false,
             desc: { ru: "Если включено, при режиме 'Нет дома' скорость ограничивается", en: "If enabled, limit speed while away" }
         },
         awayMaxSpeed: {
@@ -126,7 +132,10 @@ info = {
         securitySubscribed: false,
         securitySubscribe: undefined,
         awayActive: false,
-        nightActive: false
+        nightActive: false,
+        cachedThermostatSid: undefined,
+        cachedSecurityServiceSid: undefined,
+        cachedSecurityServiceAid: undefined
     }
 }
 
@@ -145,11 +154,21 @@ function trigger(source, value, variables, options, context) {
         const sensorSelected = options.co2sensor !== ""
         
         let thermostatService = null
-        acc.getServices().forEach(function (service) {
-            if (service.getType() == HS.Thermostat) {
-                thermostatService = service
+        if (variables.cachedThermostatSid) {
+            thermostatService = acc.getService(variables.cachedThermostatSid)
+        }
+        if (!thermostatService) {
+            acc.getServices().forEach(function (service) {
+                if (service.getType() == HS.Thermostat) {
+                    thermostatService = service
+                }
+            })
+            if (thermostatService) {
+                try {
+                    variables.cachedThermostatSid = thermostatService.getUUID()
+                } catch (e) {}
             }
-        })
+        }
 
         if (!thermostatService) {
             logError("Не обнаружен сервис термостата", source)
@@ -157,63 +176,66 @@ function trigger(source, value, variables, options, context) {
         }
 
         let fanSpeedChar = thermostatService.getCharacteristic(HC.C_FanSpeed)
-        let modeChar = thermostatService.getCharacteristic(HC.TargetHeatingCoolingState)
-        let powerCharFallback = modeChar ? null : (thermostatService.getCharacteristic(HC.Active) || thermostatService.getCharacteristic(HC.On))
+        let targetModeChar = thermostatService.getCharacteristic(HC.TargetHeatingCoolingState)
+        let powerCharFallback = targetModeChar ? null : (thermostatService.getCharacteristic(HC.Active) || thermostatService.getCharacteristic(HC.On))
         if (!fanSpeedChar) {
             logError("Не обнаружена характеристика скорости вентилятора", source)
             return
         }
 
         if(sensorSelected){
-            setSpeedFromCO2Sensor(source, variables, options, fanSpeedChar, modeChar, powerCharFallback)
+            setSpeedFromCO2Sensor(source, variables, options, fanSpeedChar, targetModeChar, powerCharFallback)
         } else {
             // Работа без датчика: берём скорость из настройки и применяем ограничения
-            let speed = options.defaultFanSpeed
-            let reasons = ["значение по умолчанию"]
-            if (options.nightLimitEnabled && variables.nightActive) {
-                speed = Math.min(speed, options.nightMaxSpeed)
-                reasons.push("ограничение ночь")
-            }
-            if (options.stopWhenAway && variables.awayActive) {
-                speed = Math.min(options.awayMaxSpeed, speed)
-                reasons.push("ограничение 'Нет дома'")
-            }
-
-            updateFanSpeed(speed===0?options.lowCO2-1:options.lowCO2+1, options, fanSpeedChar, modeChar, powerCharFallback, variables, source) // вызов с фиктивным co2 чтобы сохранить логику; передаем >lowCO2, <medium to избежать выключения внутри
+            let reasons=["значение по умолчанию"]
+            let speed=applySpeedRestrictions(options.defaultFanSpeed,options,variables,reasons)
             if(options.debugEnabled){
                 logInfo(`Debug: без датчика, скорость=${speed} [${reasons.join(', ')}]`, source, true)
             }
+            directSetFanSpeed(speed, options, fanSpeedChar, targetModeChar, powerCharFallback, variables, source, reasons)
         }
 
         // Подписка на сигнализацию
-        if (options.stopWhenAway && !variables.securitySubscribed) {
+        if ((options.stopWhenAway || options.nightLimitEnabled) && !variables.securitySubscribed) {
             let securitySubscribe = Hub.subscribeWithCondition("", "", [HS.SecuritySystem], [HC.SecuritySystemCurrentState], function (secSource, secValue) {
                 variables.awayActive = (secValue === 1)
                 variables.nightActive = (secValue === 2)
                 logInfo(`Сигнализация: ${securityStateToString(secValue)}`, secSource, options.debugEnabled)
-                updateFanSpeed(variables.lastCO2 !== undefined ? variables.lastCO2 : 0, options, fanSpeedChar, modeChar, powerCharFallback, variables, source)
+                if(options.co2sensor !== ""){
+                    updateFanSpeed(variables.lastCO2 !== undefined ? variables.lastCO2 : 0, options, fanSpeedChar, targetModeChar, powerCharFallback, variables, source)
+                } else {
+                    let reasons=["значение по умолчанию"]
+                    let speed=applySpeedRestrictions(options.defaultFanSpeed,options,variables,reasons)
+                    directSetFanSpeed(speed, options, fanSpeedChar, targetModeChar, powerCharFallback, variables, source, reasons)
+                }
             })
             variables.securitySubscribe = securitySubscribe
             variables.securitySubscribed = true
             // Инициализация текущего статуса
             let securityService = undefined
-            Hub.getAccessories().forEach(function (acc) {
-                if (securityService) return
-                try {
-                    const srv = acc.getServices().find(function (s) { return s.getType() == HS.SecuritySystem })
-                    if (srv) securityService = srv
-                } catch (e) {
-                    // пропускаем аксессуары без метода getServices
-                }
-            })
-            if (securityService) {
-                try {
-                    let curState = securityService.getCharacteristic(HC.SecuritySystemCurrentState).getValue()
-                    variables.awayActive = (curState === 1)
-                    variables.nightActive = (curState === 2)
-                    logInfo(`Текущий режим сигнализации: ${securityStateToString(curState)}`, securityService.getCharacteristic(HC.SecuritySystemCurrentState), options.debugEnabled)
-                } catch (e) {
-                    // ignore
+            if (variables.cachedSecurityServiceAid && variables.cachedSecurityServiceSid) {
+                const a = Hub.getAccessory(variables.cachedSecurityServiceAid)
+                securityService = a ? a.getService(variables.cachedSecurityServiceSid) : undefined
+            }
+            if (!securityService) {
+                Hub.getAccessories().forEach(function (acc) {
+                    if (securityService) return
+                    try {
+                        const srv = acc.getServices().find(function (s) { return s.getType() == HS.SecuritySystem })
+                        if (srv) securityService = srv
+                    } catch (e) {}
+                })
+                if (securityService) {
+                    try {
+                        variables.cachedSecurityServiceAid = securityService.getAccessory().getUUID ? securityService.getAccessory().getUUID() : securityService.getAccessory().aid
+                        variables.cachedSecurityServiceSid = securityService.getUUID()
+                    } catch (e) {}
+                    try {
+                        const curState = securityService.getCharacteristic(HC.SecuritySystemCurrentState).getValue()
+                        variables.awayActive = (curState === 1)
+                        variables.nightActive = (curState === 2)
+                        logInfo(`Текущий режим сигнализации: ${securityStateToString(curState)}`, securityService.getCharacteristic(HC.SecuritySystemCurrentState), options.debugEnabled)
+                    } catch (e) {}
                 }
             }
         }
@@ -224,56 +246,72 @@ function trigger(source, value, variables, options, context) {
                 let service = sensorSource.getService()
                 let isSelected = service.getUUID() == options.co2sensor
                 if (isSelected && fanSpeedChar) {
-                    updateFanSpeed(sensorValue, options, fanSpeedChar, modeChar, powerCharFallback, variables, source)
+                    updateFanSpeed(sensorValue, options, fanSpeedChar, targetModeChar, powerCharFallback, variables, source)
                 }
             }, acc)
             variables.subscribe = subscribe
             variables.subscribed = true
+        }
+
+        // Если датчик был отключён, удаляем прежнюю подписку
+        if(!sensorSelected && variables.subscribe){
+            try{ variables.subscribe() }catch(e){}
+            variables.subscribe = undefined
+            variables.subscribed = false
+            if(options.debugEnabled){
+                logInfo("Debug: подписка на датчик CO2 удалена", source, true)
+            }
         }
     } catch (e) {
         logError(`Ошибка настройки автоматического режима: ${e.toString()}`, source)
     }
 }
 
-function updateFanSpeed(co2Value, options, fanSpeedChar, modeChar, powerChar, variables, source) {
-    let fanSpeed
-    let initialSpeed
-    let reasons = []
-    
-    if (co2Value < options.lowCO2) {
-        fanSpeed = options.turnOffAtLowCO2 ? 0 : 1
-        reasons.push(fanSpeed===0?"низкий CO2 (выкл)":"низкий CO2 (скорость 1)")
-    } else if (co2Value < options.mediumCO2) {
-        fanSpeed = 2
+function applySpeedRestrictions(speed, options, variables, reasons){
+    const initial=speed
+    if(options.nightLimitEnabled&&variables.nightActive){
+        speed=Math.min(speed,options.nightMaxSpeed)
+        if(speed<initial) reasons.push("ограничение ночь")
+    }
+    if(options.stopWhenAway&&variables.awayActive){
+        speed=Math.min(options.awayMaxSpeed,speed)
+        if(speed<initial) reasons.push("ограничение 'Нет дома'")
+    }
+    return speed
+}
+
+function calcFanSpeed(co2Value, options, variables){
+    let speed
+    let reasons=[]
+    if(co2Value<options.lowCO2){
+        speed=options.turnOffAtLowCO2?0:1
+        reasons.push(speed===0?"низкий CO2 (выкл)":"низкий CO2 (скорость 1)")
+    }else if(co2Value<options.mediumCO2){
+        speed=2
         reasons.push("средний CO2")
-    } else if (co2Value < options.highCO2) {
-        fanSpeed = 3
+    }else if(co2Value<options.highCO2){
+        speed=3
         reasons.push("высокий CO2")
-    } else if (co2Value < options.turboThreshold) {
-        fanSpeed = 4
+    }else if(co2Value<options.turboThreshold){
+        speed=4
         reasons.push("очень высокий CO2")
-    } else {
-        fanSpeed = 5
+    }else{
+        speed=5
         reasons.push("максимальный CO2")
     }
-    initialSpeed = fanSpeed
+    speed=applySpeedRestrictions(speed,options,variables,reasons)
+    return {speed,reasons}
+}
 
-    // Ночное ограничение
-    if (options.nightLimitEnabled && variables.nightActive) {
-        fanSpeed = Math.min(fanSpeed, options.nightMaxSpeed)
-        if (fanSpeed < initialSpeed) reasons.push("ограничение ночь")
-    }
-
-    // Остановка при отсутствии дома
-    if (options.stopWhenAway && variables.awayActive) {
-        fanSpeed = Math.min(options.awayMaxSpeed, fanSpeed)
-        if (fanSpeed < initialSpeed) reasons.push("ограничение 'Нет дома'")
-    }
+function updateFanSpeed(co2Value, options, fanSpeedChar, targetModeChar, powerCharFallback, variables, source) {
+    var calcRes = calcFanSpeed(co2Value, options, variables)
+    var fanSpeed = calcRes.speed
+    var reasons = calcRes.reasons
     
     if (fanSpeed === 0) {
         if (variables.lastFanSpeed !== 0) {
-            if (modeChar) modeChar.setValue(0)
-            else if (powerChar) powerChar.setValue(0)
+            if (targetModeChar) targetModeChar.setValue(0)
+            else if (powerCharFallback) powerCharFallback.setValue(0)
             let txt=`Бризер выключен (CO2: ${co2Value} ppm)`
             if(reasons.length) txt+=` [${reasons.join(', ')}]`
             logInfo(txt, source, options.debugEnabled)
@@ -282,10 +320,10 @@ function updateFanSpeed(co2Value, options, fanSpeedChar, modeChar, powerChar, va
             variables.lastUpdateTime = Date.now()
         }
     } else {
-        if (modeChar) {
-            if (modeChar.getValue() !== 2) modeChar.setValue(2)
-        } else if (powerChar) {
-            if (powerChar.getValue() !== 1) powerChar.setValue(1)
+        if (targetModeChar) {
+            if (targetModeChar.getValue() !== 2) targetModeChar.setValue(2)
+        } else if (powerCharFallback) {
+            if (powerCharFallback.getValue() !== 1) powerCharFallback.setValue(1)
         }
         fanSpeedChar.setValue(fanSpeed)
         let txt=`Установлена скорость вентилятора: ${fanSpeed} (CO2: ${co2Value} ppm)`
@@ -297,7 +335,7 @@ function updateFanSpeed(co2Value, options, fanSpeedChar, modeChar, powerChar, va
     }
 }
 
-function setSpeedFromCO2Sensor(source, variables, options, fanSpeedChar, modeChar, powerChar) {
+function setSpeedFromCO2Sensor(source, variables, options, fanSpeedChar, targetModeChar, powerCharFallback) {
     try {
         const cdata = options.co2sensor.split('.')
         const aid = cdata[0]
@@ -325,7 +363,7 @@ function setSpeedFromCO2Sensor(source, variables, options, fanSpeedChar, modeCha
                 return
             }
             
-            updateFanSpeed(co2Value, options, fanSpeedChar, modeChar, powerChar, variables, source)
+            updateFanSpeed(co2Value, options, fanSpeedChar, targetModeChar, powerCharFallback, variables, source)
         } else {
             logError(`Не найден датчик CO2. ID: ${options.co2sensor}`, source)
             return
@@ -394,6 +432,30 @@ function securityStateToString(state) {
         case 4: return "Triggered";
         default: return `Unknown(${state})`;
     }
+}
+
+function directSetFanSpeed(speed, options, fanSpeedChar, targetModeChar, powerCharFallback, variables, source, reasons){
+    if(speed===0){
+        if(variables.lastFanSpeed!==0){
+            if(targetModeChar) targetModeChar.setValue(0)
+            else if(powerCharFallback) powerCharFallback.setValue(0)
+            let txt = `Бризер выключен`
+            if(reasons.length) txt+=` [${reasons.join(', ')}]`
+            logInfo(txt, source, options.debugEnabled)
+            variables.lastFanSpeed=0
+        }
+        return
+    }
+    if(targetModeChar){
+        if(targetModeChar.getValue()!==2) targetModeChar.setValue(2)
+    } else if(powerCharFallback){
+        if(powerCharFallback.getValue()!==1) powerCharFallback.setValue(1)
+    }
+    fanSpeedChar.setValue(speed)
+    let txt=`Установлена скорость вентилятора: ${speed}`
+    if(reasons.length) txt+=` [${reasons.join(', ')}]`
+    logInfo(txt, source, options.debugEnabled)
+    variables.lastFanSpeed=speed
 }
 
 let servicesListUnsort = []
